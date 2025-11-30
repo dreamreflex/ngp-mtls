@@ -6,12 +6,24 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"reverse-tunnel/internal/proto"
 	"reverse-tunnel/internal/pqctls"
 )
+
+// ClientInfo 表示一个客户端的信息
+type ClientInfo struct {
+	ID           string      // 客户端唯一标识
+	Conn         net.Conn    // 控制连接
+	ConnMap      sync.Map    // map[uint32]net.Conn - 该客户端的连接映射
+	NextConnID   uint32      // 该客户端的下一个连接ID
+	LocalAddr    string      // 客户端本地地址（从INIT帧获取）
+	RemotePort   int         // 客户端指定的远程端口
+	PublicListener net.Listener // 该客户端专用的公开端口监听器（如果指定了远程端口）
+}
 
 // Server 表示反向隧道服务器
 type Server struct {
@@ -24,21 +36,19 @@ type Server struct {
 	tlsKeyFile  string
 	tlsCAFile   string
 
-	controlConn net.Conn // 控制连接（与 client 的连接）
-	controlMu   sync.RWMutex
-
-	// connMap 管理 connID 到外部连接的映射
-	connMap sync.Map // map[uint32]net.Conn
-
-	// nextConnID 用于生成唯一的连接 ID
-	nextConnID uint32
-
-	// 动态公开端口监听器（由客户端配置时创建）
+	// 多客户端支持：管理所有客户端连接
+	clients     map[string]*ClientInfo // map[clientID]*ClientInfo
+	clientsMu   sync.RWMutex
+	
+	// 全局公开端口监听器（如果服务器指定了公开端口，所有客户端共享）
 	publicListener net.Listener
 	publicListenerMu sync.RWMutex
 	
-	// 公开连接通道
+	// 公开连接通道（用于全局监听器）
 	publicConnChan chan net.Conn
+	
+	// 下一个客户端ID
+	nextClientID uint32
 }
 
 // NewServer 创建一个新的服务器实例
@@ -47,6 +57,8 @@ func NewServer(controlListenAddr, publicListenAddr string) *Server {
 		controlListenAddr: controlListenAddr,
 		publicListenAddr:  publicListenAddr,
 		useTLS:            false,
+		clients:           make(map[string]*ClientInfo),
+		publicConnChan:    make(chan net.Conn, 100), // 缓冲通道，支持多个连接
 	}
 }
 
@@ -59,6 +71,8 @@ func NewServerWithTLS(controlListenAddr, publicListenAddr, certFile, keyFile, ca
 		tlsCertFile:       certFile,
 		tlsKeyFile:        keyFile,
 		tlsCAFile:         caFile,
+		clients:           make(map[string]*ClientInfo),
+		publicConnChan:    make(chan net.Conn, 100), // 缓冲通道，支持多个连接
 	}
 }
 
@@ -104,24 +118,7 @@ func (s *Server) Run(ctx context.Context) error {
 		log.Printf("公开端口未指定，等待客户端配置...")
 	}
 
-	// 等待控制连接（client 连接）
-	controlConnChan := make(chan net.Conn, 1)
-	controlErrChan := make(chan error, 1)
-
-	go func() {
-		log.Printf("等待 client 连接...")
-		conn, err := controlListener.Accept()
-		if err != nil {
-			controlErrChan <- err
-			return
-		}
-		controlConnChan <- conn
-	}()
-
-	// 初始化公开连接通道
-	s.publicConnChan = make(chan net.Conn)
-	
-	// 处理公开端口连接的 goroutine（如果已启动）
+	// 处理公开端口连接的 goroutine（如果已启动全局监听器）
 	if publicListener != nil {
 		s.publicListenerMu.Lock()
 		s.publicListener = publicListener
@@ -129,106 +126,121 @@ func (s *Server) Run(ctx context.Context) error {
 		go s.acceptPublicConnections(ctx, publicListener)
 	}
 
-	// 主循环：等待控制连接建立，支持重连
-	for {
-		// 重新初始化控制连接等待通道
-		controlConnChan = make(chan net.Conn, 1)
-		controlErrChan = make(chan error, 1)
-
-		go func() {
-			log.Printf("等待 client 连接...")
-			conn, err := controlListener.Accept()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					controlErrChan <- err
-				}
+	// 持续接受客户端连接的 goroutine
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-			controlConnChan <- conn
-		}()
-
-		// 等待控制连接建立
-		select {
-		case <-ctx.Done():
-			log.Printf("服务器正在关闭...")
-			s.cleanup()
-			return ctx.Err()
-		case err := <-controlErrChan:
-			if err != nil {
-				log.Printf("接受控制连接错误: %v", err)
-				// 继续循环，等待重连
-				continue
-			}
-		case controlConn := <-controlConnChan:
-			s.controlMu.Lock()
-			s.controlConn = controlConn
-			s.controlMu.Unlock()
-			log.Printf("client 已连接: %s", controlConn.RemoteAddr())
-
-			// 启动从 client 读取帧的 goroutine
-			clientDone := make(chan struct{})
-			go func() {
-				s.handleFramesFromClient(ctx, controlConn)
-				close(clientDone)
-			}()
-
-			// 处理公开连接和上下文取消
-			connectionActive := true
-			for connectionActive {
-				select {
-				case <-ctx.Done():
-					log.Printf("服务器正在关闭...")
-					s.cleanup()
-					return ctx.Err()
-				case <-clientDone:
-					// 控制连接断开，清理并等待重连
-					log.Printf("控制连接已断开，等待客户端重连...")
-					s.controlMu.Lock()
-					s.controlConn = nil
-					s.controlMu.Unlock()
-					// 清理所有外部连接
-					s.connMap.Range(func(key, value interface{}) bool {
-						if conn, ok := value.(net.Conn); ok {
-							conn.Close()
-						}
-						s.connMap.Delete(key)
-						return true
-					})
-					connectionActive = false
-					// 跳出内层循环，重新等待控制连接
-				case publicConn := <-s.publicConnChan:
-					// 有新的外部连接，创建 connID 并通知 client
-					s.handlePublicConnection(ctx, publicConn)
+			default:
+				log.Printf("等待 client 连接...")
+				conn, err := controlListener.Accept()
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("接受控制连接错误: %v", err)
+					continue
 				}
+				
+				// 为新客户端分配ID并注册
+				clientID := s.registerClient(conn)
+				log.Printf("客户端已连接: %s (clientID=%s)", conn.RemoteAddr(), clientID)
+				
+				// 为每个客户端启动独立的帧处理 goroutine
+				go s.handleClientConnection(ctx, clientID, conn)
 			}
 		}
+	}()
+
+	// 等待上下文取消
+	<-ctx.Done()
+	log.Printf("服务器正在关闭...")
+	s.cleanup()
+	return ctx.Err()
+}
+
+// registerClient 注册新客户端并返回clientID
+func (s *Server) registerClient(conn net.Conn) string {
+	clientID := fmt.Sprintf("client-%d", atomic.AddUint32(&s.nextClientID, 1))
+	
+	clientInfo := &ClientInfo{
+		ID:         clientID,
+		Conn:       conn,
+		NextConnID: 0,
 	}
+	
+	s.clientsMu.Lock()
+	s.clients[clientID] = clientInfo
+	s.clientsMu.Unlock()
+	
+	return clientID
+}
+
+// unregisterClient 注销客户端
+func (s *Server) unregisterClient(clientID string) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	
+	clientInfo, ok := s.clients[clientID]
+	if !ok {
+		return
+	}
+	
+	// 清理该客户端的所有连接
+	clientInfo.ConnMap.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(net.Conn); ok {
+			conn.Close()
+		}
+		clientInfo.ConnMap.Delete(key)
+		return true
+	})
+	
+	// 关闭该客户端的公开端口监听器
+	if clientInfo.PublicListener != nil {
+		clientInfo.PublicListener.Close()
+	}
+	
+	// 关闭控制连接
+	if clientInfo.Conn != nil {
+		clientInfo.Conn.Close()
+	}
+	
+	delete(s.clients, clientID)
+	log.Printf("客户端已注销: %s", clientID)
+}
+
+// handleClientConnection 处理单个客户端连接
+func (s *Server) handleClientConnection(ctx context.Context, clientID string, conn net.Conn) {
+	defer func() {
+		s.unregisterClient(clientID)
+	}()
+	
+	// 启动从客户端读取帧的 goroutine
+	s.handleFramesFromClient(ctx, clientID, conn)
 }
 
 // handlePublicConnection 处理新的公开连接
-func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn) {
-	// 生成新的 connID
-	connID := atomic.AddUint32(&s.nextConnID, 1)
-	log.Printf("新外部连接: %s, connID=%d", publicConn.RemoteAddr(), connID)
-
-	// 将连接存入 map
-	s.connMap.Store(connID, publicConn)
-
-	// 发送 NEW_CONN 帧给 client
-	s.controlMu.RLock()
-	controlConn := s.controlConn
-	s.controlMu.RUnlock()
-
-	if controlConn == nil {
-		log.Printf("错误: 控制连接不存在，关闭外部连接 connID=%d", connID)
+// 注意：这个方法需要知道应该转发到哪个客户端
+// 当前实现：如果只有一个客户端，转发给它；如果有多个，需要根据端口或其他方式路由
+func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn, clientID string) {
+	// 获取客户端信息
+	s.clientsMu.RLock()
+	clientInfo, ok := s.clients[clientID]
+	s.clientsMu.RUnlock()
+	
+	if !ok {
+		log.Printf("错误: 客户端不存在 (clientID=%s)，关闭外部连接", clientID)
 		publicConn.Close()
-		s.connMap.Delete(connID)
 		return
 	}
+	
+	// 为该客户端生成新的 connID
+	connID := atomic.AddUint32(&clientInfo.NextConnID, 1)
+	log.Printf("新外部连接: %s, clientID=%s, connID=%d", publicConn.RemoteAddr(), clientID, connID)
 
+	// 先发送 NEW_CONN 帧，等待客户端建立本地连接
+	// 注意：此时先不将连接存入 map，等客户端确认建立成功后再存入
 	frame := &proto.Frame{
 		Type:    proto.FrameTypeNEW_CONN,
 		ConnID:  connID,
@@ -237,29 +249,36 @@ func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn
 
 	frameData, err := proto.EncodeFrame(frame)
 	if err != nil {
-		log.Printf("编码 NEW_CONN 帧错误 (connID=%d): %v", connID, err)
+		log.Printf("编码 NEW_CONN 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 		publicConn.Close()
-		s.connMap.Delete(connID)
 		return
 	}
 
-	if _, err := controlConn.Write(frameData); err != nil {
-		log.Printf("发送 NEW_CONN 帧错误 (connID=%d): %v", connID, err)
+	if _, err := clientInfo.Conn.Write(frameData); err != nil {
+		log.Printf("发送 NEW_CONN 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 		publicConn.Close()
-		s.connMap.Delete(connID)
 		return
 	}
+
+	// 将连接存入该客户端的 map（在发送 NEW_CONN 之后）
+	// 这样即使客户端连接本地服务失败，我们也能正确处理 CLOSE_CONN
+	clientInfo.ConnMap.Store(connID, publicConn)
 
 	// 启动两个方向的转发：
 	// 1. 从公开连接读取数据，发送 DATA 帧给 client
 	// 2. 从 client 接收 DATA 帧（在 handleFramesFromClient 中处理）
 
 	// 从公开连接读取并转发给 client
+	// 注意：这里立即开始读取，但如果客户端连接本地服务失败，可能会收到 CLOSE_CONN
+	// 此时连接会被客户端关闭，导致 "use of closed network connection" 错误
 	go func() {
 		defer func() {
-			publicConn.Close()
-			s.connMap.Delete(connID)
-			log.Printf("外部连接已关闭: connID=%d", connID)
+			// 检查连接是否还在 map 中（可能已经被 handleCloseFrame 删除了）
+			if _, exists := clientInfo.ConnMap.Load(connID); exists {
+				publicConn.Close()
+				clientInfo.ConnMap.Delete(connID)
+				log.Printf("外部连接已关闭: clientID=%s, connID=%d", clientID, connID)
+			}
 		}()
 
 		buf := make([]byte, 4096)
@@ -268,17 +287,41 @@ func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn
 			case <-ctx.Done():
 				return
 			default:
+				// 检查连接是否还在 map 中
+				if _, exists := clientInfo.ConnMap.Load(connID); !exists {
+					// 连接已经被删除（可能是客户端发送了 CLOSE_CONN）
+					return
+				}
+				
 				n, err := publicConn.Read(buf)
 				if err != nil {
+					// 检查是否是连接关闭错误
 					if err != io.EOF {
-						log.Printf("读取公开连接数据错误 (connID=%d): %v", connID, err)
+						// 检查是否是 "use of closed network connection" 错误
+						// 这通常发生在客户端已经关闭了本地连接并发送了 CLOSE_CONN
+						errStr := err.Error()
+						if strings.Contains(errStr, "use of closed network connection") {
+							// 连接已经被关闭，可能是客户端主动关闭的（连接本地服务失败）
+							// 不需要再发送 CLOSE_CONN，因为客户端已经发送了
+							log.Printf("公开连接已关闭 (clientID=%s, connID=%d)，可能是客户端连接本地服务失败", clientID, connID)
+						} else {
+							log.Printf("读取公开连接数据错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
+							// 发送 CLOSE_CONN 帧通知客户端
+							s.sendCloseFrame(clientID, connID)
+						}
+					} else {
+						// EOF，正常关闭
+						s.sendCloseFrame(clientID, connID)
 					}
-					// 发送 CLOSE_CONN 帧
-					s.sendCloseFrame(connID)
 					return
 				}
 
 				if n > 0 {
+					// 检查连接是否还在 map 中（可能在读取期间被关闭了）
+					if _, exists := clientInfo.ConnMap.Load(connID); !exists {
+						return
+					}
+					
 					// 发送 DATA 帧给 client
 					dataFrame := &proto.Frame{
 						Type:    proto.FrameTypeDATA,
@@ -288,20 +331,12 @@ func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn
 
 					frameData, err := proto.EncodeFrame(dataFrame)
 					if err != nil {
-						log.Printf("编码 DATA 帧错误 (connID=%d): %v", connID, err)
+						log.Printf("编码 DATA 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 						return
 					}
 
-					s.controlMu.RLock()
-					ctrlConn := s.controlConn
-					s.controlMu.RUnlock()
-
-					if ctrlConn == nil {
-						return
-					}
-
-					if _, err := ctrlConn.Write(frameData); err != nil {
-						log.Printf("发送 DATA 帧错误 (connID=%d): %v", connID, err)
+					if _, err := clientInfo.Conn.Write(frameData); err != nil {
+						log.Printf("发送 DATA 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 						return
 					}
 				}
@@ -311,13 +346,10 @@ func (s *Server) handlePublicConnection(ctx context.Context, publicConn net.Conn
 }
 
 // handleFramesFromClient 处理来自 client 的帧
-func (s *Server) handleFramesFromClient(ctx context.Context, controlConn net.Conn) {
+func (s *Server) handleFramesFromClient(ctx context.Context, clientID string, conn net.Conn) {
 	defer func() {
-		controlConn.Close()
-		s.controlMu.Lock()
-		s.controlConn = nil
-		s.controlMu.Unlock()
-		log.Printf("控制连接已关闭")
+		conn.Close()
+		log.Printf("控制连接已关闭: clientID=%s", clientID)
 	}()
 
 	for {
@@ -325,10 +357,10 @@ func (s *Server) handleFramesFromClient(ctx context.Context, controlConn net.Con
 		case <-ctx.Done():
 			return
 		default:
-			frame, err := proto.DecodeFrame(controlConn)
+			frame, err := proto.DecodeFrame(conn)
 			if err != nil {
 				if err != io.EOF {
-					log.Printf("解码帧错误: %v", err)
+					log.Printf("解码帧错误 (clientID=%s): %v", clientID, err)
 				}
 				return
 			}
@@ -336,51 +368,73 @@ func (s *Server) handleFramesFromClient(ctx context.Context, controlConn net.Con
 			switch frame.Type {
 			case proto.FrameTypeINIT:
 				// 处理初始化配置（客户端指定远程端口）
-				s.handleInitFrame(ctx, frame)
+				s.handleInitFrame(ctx, clientID, frame)
 			case proto.FrameTypeDATA:
 				// 将数据写入对应的外部连接
-				s.handleDataFrame(frame)
+				s.handleDataFrame(clientID, frame)
 			case proto.FrameTypeCLOSE:
 				// 关闭对应的外部连接
-				s.handleCloseFrame(frame)
+				s.handleCloseFrame(clientID, frame)
 			default:
-				log.Printf("未知帧类型: %d, connID=%d", frame.Type, frame.ConnID)
+				log.Printf("未知帧类型: %d, clientID=%s, connID=%d", frame.Type, clientID, frame.ConnID)
 			}
 		}
 	}
 }
 
 // handleDataFrame 处理来自 client 的 DATA 帧
-func (s *Server) handleDataFrame(frame *proto.Frame) {
-	conn, ok := s.connMap.Load(frame.ConnID)
+func (s *Server) handleDataFrame(clientID string, frame *proto.Frame) {
+	// 获取客户端信息
+	s.clientsMu.RLock()
+	clientInfo, ok := s.clients[clientID]
+	s.clientsMu.RUnlock()
+	
 	if !ok {
-		log.Printf("警告: 未找到 connID=%d 对应的连接", frame.ConnID)
+		log.Printf("警告: 客户端不存在 (clientID=%s)", clientID)
+		return
+	}
+	
+	conn, ok := clientInfo.ConnMap.Load(frame.ConnID)
+	if !ok {
+		log.Printf("警告: 未找到连接 (clientID=%s, connID=%d)", clientID, frame.ConnID)
 		return
 	}
 
 	publicConn, ok := conn.(net.Conn)
 	if !ok {
-		log.Printf("错误: connID=%d 对应的连接类型错误", frame.ConnID)
+		log.Printf("错误: 连接类型错误 (clientID=%s, connID=%d)", clientID, frame.ConnID)
 		return
 	}
 
 	// 将数据写入外部连接
 	if len(frame.Payload) > 0 {
 		if _, err := publicConn.Write(frame.Payload); err != nil {
-			log.Printf("写入外部连接错误 (connID=%d): %v", frame.ConnID, err)
+			log.Printf("写入外部连接错误 (clientID=%s, connID=%d): %v", clientID, frame.ConnID, err)
 			// 连接可能已关闭，清理并发送 CLOSE_CONN
 			publicConn.Close()
-			s.connMap.Delete(frame.ConnID)
-			s.sendCloseFrame(frame.ConnID)
+			clientInfo.ConnMap.Delete(frame.ConnID)
+			s.sendCloseFrame(clientID, frame.ConnID)
 		}
 	}
 }
 
 // handleCloseFrame 处理来自 client 的 CLOSE_CONN 帧
-func (s *Server) handleCloseFrame(frame *proto.Frame) {
-	conn, ok := s.connMap.LoadAndDelete(frame.ConnID)
+func (s *Server) handleCloseFrame(clientID string, frame *proto.Frame) {
+	// 获取客户端信息
+	s.clientsMu.RLock()
+	clientInfo, ok := s.clients[clientID]
+	s.clientsMu.RUnlock()
+	
 	if !ok {
-		// 连接可能已经关闭
+		log.Printf("警告: 收到 CLOSE_CONN 帧但客户端不存在 (clientID=%s, connID=%d)", clientID, frame.ConnID)
+		return
+	}
+	
+	// 尝试删除连接（可能已经被读取 goroutine 删除了）
+	conn, ok := clientInfo.ConnMap.LoadAndDelete(frame.ConnID)
+	if !ok {
+		// 连接可能已经关闭，这是正常的（可能客户端连接本地服务失败，或读取 goroutine 已经关闭）
+		// 不记录日志，避免日志噪音
 		return
 	}
 
@@ -389,17 +443,19 @@ func (s *Server) handleCloseFrame(frame *proto.Frame) {
 		return
 	}
 
+	// 关闭外部连接
 	publicConn.Close()
-	log.Printf("收到 CLOSE_CONN 帧，已关闭外部连接: connID=%d", frame.ConnID)
+	log.Printf("收到 CLOSE_CONN 帧，已关闭外部连接: clientID=%s, connID=%d", clientID, frame.ConnID)
 }
 
 // sendCloseFrame 发送 CLOSE_CONN 帧给 client
-func (s *Server) sendCloseFrame(connID uint32) {
-	s.controlMu.RLock()
-	controlConn := s.controlConn
-	s.controlMu.RUnlock()
-
-	if controlConn == nil {
+func (s *Server) sendCloseFrame(clientID string, connID uint32) {
+	// 获取客户端信息
+	s.clientsMu.RLock()
+	clientInfo, ok := s.clients[clientID]
+	s.clientsMu.RUnlock()
+	
+	if !ok || clientInfo.Conn == nil {
 		return
 	}
 
@@ -411,16 +467,16 @@ func (s *Server) sendCloseFrame(connID uint32) {
 
 	frameData, err := proto.EncodeFrame(frame)
 	if err != nil {
-		log.Printf("编码 CLOSE_CONN 帧错误 (connID=%d): %v", connID, err)
+		log.Printf("编码 CLOSE_CONN 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 		return
 	}
 
-	if _, err := controlConn.Write(frameData); err != nil {
-		log.Printf("发送 CLOSE_CONN 帧错误 (connID=%d): %v", connID, err)
+	if _, err := clientInfo.Conn.Write(frameData); err != nil {
+		log.Printf("发送 CLOSE_CONN 帧错误 (clientID=%s, connID=%d): %v", clientID, connID, err)
 	}
 }
 
-// acceptPublicConnections 接受公开端口连接
+// acceptPublicConnections 接受公开端口连接（全局监听器）
 func (s *Server) acceptPublicConnections(ctx context.Context, listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
@@ -433,79 +489,120 @@ func (s *Server) acceptPublicConnections(ctx context.Context, listener net.Liste
 				continue
 			}
 		}
-		s.publicConnChan <- conn
+		
+		// 对于全局监听器，需要路由到某个客户端
+		// 当前实现：路由到第一个可用的客户端（简单策略）
+		// 未来可以改进：通过某种标识（如SNI、路径等）路由到特定客户端
+		s.clientsMu.RLock()
+		var targetClientID string
+		for id := range s.clients {
+			targetClientID = id
+			break // 使用第一个客户端
+		}
+		s.clientsMu.RUnlock()
+		
+		if targetClientID == "" {
+			log.Printf("警告: 没有可用的客户端，关闭公开连接: %s", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		
+		// 转发到目标客户端
+		s.handlePublicConnection(ctx, conn, targetClientID)
+	}
+}
+
+// acceptPublicConnectionsForClient 为特定客户端接受公开端口连接
+func (s *Server) acceptPublicConnectionsForClient(ctx context.Context, clientID string, listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("接受公开连接错误 (clientID=%s): %v", clientID, err)
+				continue
+			}
+		}
+		
+		// 直接转发到指定客户端
+		s.handlePublicConnection(ctx, conn, clientID)
 	}
 }
 
 // handleInitFrame 处理初始化配置帧
-func (s *Server) handleInitFrame(ctx context.Context, frame *proto.Frame) {
-	// 如果服务器已经指定了公开端口，忽略客户端的配置
+func (s *Server) handleInitFrame(ctx context.Context, clientID string, frame *proto.Frame) {
+	// 获取客户端信息
+	s.clientsMu.Lock()
+	clientInfo, ok := s.clients[clientID]
+	s.clientsMu.Unlock()
+	
+	if !ok {
+		log.Printf("错误: 客户端不存在 (clientID=%s)", clientID)
+		return
+	}
+	
+	// 如果服务器已经指定了公开端口，客户端使用全局监听器
 	if s.publicListenAddr != "" {
-		log.Printf("服务器已指定公开端口，忽略客户端配置")
+		log.Printf("服务器已指定公开端口，客户端 %s 使用全局监听器", clientID)
+		clientInfo.LocalAddr = ""
+		clientInfo.RemotePort = 0
 		return
 	}
 
 	// 解析配置
 	config, err := proto.DecodeInitConfig(frame.Payload)
 	if err != nil {
-		log.Printf("解析 INIT 配置错误: %v", err)
+		log.Printf("解析 INIT 配置错误 (clientID=%s): %v", clientID, err)
 		return
 	}
 
-	// 检查是否已经创建了监听器
-	s.publicListenerMu.RLock()
-	existingListener := s.publicListener
-	s.publicListenerMu.RUnlock()
+	// 更新客户端信息
+	clientInfo.LocalAddr = config.LocalAddr
+	clientInfo.RemotePort = config.RemotePort
 
-	if existingListener != nil {
-		log.Printf("公开端口监听器已存在，忽略新的配置")
-		return
+	// 如果客户端指定了远程端口，为该客户端创建独立的监听器
+	if config.RemotePort > 0 {
+		// 检查该客户端是否已经有监听器
+		if clientInfo.PublicListener != nil {
+			log.Printf("客户端 %s 的公开端口监听器已存在，忽略新配置", clientID)
+			return
+		}
+
+		// 创建该客户端专用的公开端口监听器
+		publicAddr := fmt.Sprintf(":%d", config.RemotePort)
+		listener, err := net.Listen("tcp", publicAddr)
+		if err != nil {
+			log.Printf("创建公开端口监听器失败 (clientID=%s, 端口 %d): %v", clientID, config.RemotePort, err)
+			return
+		}
+
+		clientInfo.PublicListener = listener
+		log.Printf("根据客户端 %s 配置，公开端口监听器已启动: %s", clientID, publicAddr)
+
+		// 启动接受连接的 goroutine（专门为该客户端）
+		go s.acceptPublicConnectionsForClient(ctx, clientID, listener)
 	}
-
-	// 创建新的公开端口监听器
-	publicAddr := fmt.Sprintf(":%d", config.RemotePort)
-	listener, err := net.Listen("tcp", publicAddr)
-	if err != nil {
-		log.Printf("创建公开端口监听器失败 (端口 %d): %v", config.RemotePort, err)
-		return
-	}
-
-	s.publicListenerMu.Lock()
-	s.publicListener = listener
-	s.publicListenerMu.Unlock()
-
-	log.Printf("根据客户端配置，公开端口监听器已启动: %s", publicAddr)
-
-	// 启动接受连接的 goroutine
-	go s.acceptPublicConnections(ctx, listener)
 }
 
 // cleanup 清理所有资源
 func (s *Server) cleanup() {
-	// 关闭控制连接
-	s.controlMu.Lock()
-	if s.controlConn != nil {
-		s.controlConn.Close()
-		s.controlConn = nil
+	// 清理所有客户端
+	s.clientsMu.Lock()
+	for clientID := range s.clients {
+		s.unregisterClient(clientID)
 	}
-	s.controlMu.Unlock()
+	s.clients = make(map[string]*ClientInfo)
+	s.clientsMu.Unlock()
 
-	// 关闭动态创建的公开端口监听器
+	// 关闭全局公开端口监听器
 	s.publicListenerMu.Lock()
 	if s.publicListener != nil {
 		s.publicListener.Close()
 		s.publicListener = nil
 	}
 	s.publicListenerMu.Unlock()
-
-	// 关闭所有外部连接
-	s.connMap.Range(func(key, value interface{}) bool {
-		if conn, ok := value.(net.Conn); ok {
-			conn.Close()
-		}
-		s.connMap.Delete(key)
-		return true
-	})
 
 	log.Printf("服务器资源已清理")
 }
