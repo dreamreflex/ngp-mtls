@@ -203,6 +203,8 @@ reverse-tunnel/
 3. **动态端口**：当客户端指定远程端口时，服务器会为该客户端创建独立的监听器；如果端口已被占用，连接会失败
 4. **全局端口路由**：如果服务器指定了全局公开端口，公开连接会路由到第一个可用的客户端（未来可改进为更智能的路由策略）
 5. **PQC mTLS**：使用 PQC mTLS 时，确保证书文件存在且路径正确
+6. **TCP 连接**：所有连接都使用 TCP 协议（控制连接、公开连接、本地连接）
+7. **队头阻塞**：所有逻辑连接共享单条 TCP 控制连接，大文件传输可能阻塞其他连接。详细分析请参考 [TCP和队头阻塞分析.md](./TCP和队头阻塞分析.md)
 
 ## 故障排查
 
@@ -226,8 +228,10 @@ reverse-tunnel/
 
 ## 相关文档
 
-- [WINDOWS_BUILD.md](./WINDOWS_BUILD.md) - Windows 编译详细指南
-- [PQC_ANALYSIS.md](./PQC_ANALYSIS.md) - PQC 配置分析报告
+- [Windows编译说明.md](./Windows编译说明.md) - Windows 编译详细指南
+- [从Linux编译Windows版本说明.md](./从Linux编译Windows版本说明.md) - 为什么无法交叉编译及替代方案
+- [PQC分析.md](./PQC分析.md) - PQC 配置分析报告
+- [TCP和队头阻塞分析.md](./TCP和队头阻塞分析.md) - TCP 连接和队头阻塞问题分析
 
 ## 许可证
 
