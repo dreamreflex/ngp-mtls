@@ -1,0 +1,13 @@
+{
+  "server": "127.0.0.1:7000",
+  "local": "127.0.0.1:80",
+  "remote_port": 8080,
+  "tls": {
+    "enabled": false,
+    "cert": "/root/pq-certs/client.crt",
+    "key": "/root/pq-certs/client.key",
+    "ca": "/root/pq-certs/ca.crt",
+    "server_name": ""
+  }
+}
+

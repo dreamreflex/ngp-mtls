@@ -228,6 +228,7 @@ reverse-tunnel/
 
 ## 相关文档
 
+- [config/README.md](./config/README.md) - 配置文件使用说明
 - [Windows编译说明.md](./Windows编译说明.md) - Windows 编译详细指南
 - [从Linux编译Windows版本说明.md](./从Linux编译Windows版本说明.md) - 为什么无法交叉编译及替代方案
 - [PQC分析.md](./PQC分析.md) - PQC 配置分析报告
