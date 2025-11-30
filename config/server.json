@@ -1,0 +1,11 @@
+{
+  "control_listen": ":7000",
+  "public_listen": "",
+  "tls": {
+    "enabled": false,
+    "cert": "/root/pq-certs/server.crt",
+    "key": "/root/pq-certs/server.key",
+    "ca": "/root/pq-certs/ca.crt"
+  }
+}
+
