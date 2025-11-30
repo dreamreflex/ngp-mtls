@@ -75,7 +75,11 @@ go build -o bin/client ./cmd/client
 
 **重要**：Windows 上编译需要 **OpenSSL 3.5+ with oqs-provider** 环境，否则无法编译成功。
 
-详细说明请参考 [WINDOWS_BUILD.md](./WINDOWS_BUILD.md)
+**注意**：由于项目依赖 CGO 和 OpenSSL，无法在 Linux 系统上交叉编译 Windows 版本。必须在 Windows 系统上编译，或使用 WSL2。
+
+详细说明请参考：
+- [Windows编译说明.md](./Windows编译说明.md) - Windows 系统上编译的详细步骤
+- [从Linux编译Windows版本说明.md](./从Linux编译Windows版本说明.md) - 为什么无法交叉编译及替代方案
 
 ## 使用方法
 
